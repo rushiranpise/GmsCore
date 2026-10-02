@@ -1,0 +1,197 @@
+name: Sync upstream microG
+
+on:
+  schedule:
+    # Every Monday at 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: Repository to sync from
+        required: true
+        default: microg/GmsCore
+      upstream_ref:
+        description: Branch to merge
+        required: true
+        default: master
+      base:
+        description: Branch to merge into and open the pull request against
+        required: true
+        default: dev
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream into ${{ inputs.base || 'dev' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # A personal access token is required here: pushes and pull requests made with
+      # the default GITHUB_TOKEN do not trigger other workflows, so the Gradle build
+      # in build.yml would never run on the pull request this job opens. Without the
+      # secret the job still runs, but the pull request will not be built.
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+      UPSTREAM_REPO: ${{ inputs.upstream_repo || 'microg/GmsCore' }}
+      UPSTREAM_REF: ${{ inputs.upstream_ref || 'master' }}
+      BASE: ${{ inputs.base || 'dev' }}
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ env.GH_TOKEN }}
+
+      - name: "Set Git user"
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: "Fetch upstream"
+        id: fetch
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch --quiet upstream "${UPSTREAM_REF}"
+
+          SHA=$(git rev-parse --short=7 "upstream/${UPSTREAM_REF}")
+          BEHIND=$(git rev-list --count "origin/${BASE}..upstream/${UPSTREAM_REF}")
+
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "behind=${BEHIND}" >> "$GITHUB_OUTPUT"
+          echo "branch=sync/upstream-${SHA}" >> "$GITHUB_OUTPUT"
+          echo "${UPSTREAM_REPO}@${UPSTREAM_REF} is ${BEHIND} commits ahead of origin/${BASE}"
+
+          # Nothing to do when dev already contains upstream's tip.
+          if [ "${BEHIND}" = "0" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Report upstream commits"
+        if: steps.fetch.outputs.skip == 'false'
+        run: |
+          {
+            echo "### ${UPSTREAM_REPO}@${UPSTREAM_REF} is ${{ steps.fetch.outputs.behind }} commits ahead of origin/${BASE}"
+            echo
+            git log --reverse --format='- %h %s' "origin/${BASE}..upstream/${UPSTREAM_REF}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Skip when the release is already synced"
+        if: steps.fetch.outputs.skip == 'true'
+        run: echo "origin/${BASE} already contains ${UPSTREAM_REPO}@${UPSTREAM_REF} (${{ steps.fetch.outputs.sha }}). Nothing to sync."
+
+      - name: "Check for an existing sync branch"
+        id: exists
+        if: steps.fetch.outputs.skip == 'false'
+        run: |
+          if git ls-remote --exit-code --heads origin "${{ steps.fetch.outputs.branch }}" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Branch ${{ steps.fetch.outputs.branch }} already exists, nothing to do."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Merge upstream"
+        id: merge
+        if: steps.fetch.outputs.skip == 'false' && steps.exists.outputs.found == 'false'
+        run: |
+          BRANCH="${{ steps.fetch.outputs.branch }}"
+          git checkout -b "${BRANCH}" "origin/${BASE}"
+
+          # --no-commit so every path below lands in the same, message-owning commit.
+          : > /tmp/auto-translations.txt
+          : > /tmp/needs-review.txt
+
+          if git merge --no-ff --no-commit "upstream/${UPSTREAM_REF}"; then
+            echo "conflicts=0" >> "$GITHUB_OUTPUT"
+          else
+            CONFLICTED="$(git diff --name-only --diff-filter=U)"
+
+            # Translation resources are the same keys translated again, and upstream's
+            # copy is fresher, so take upstream's side for those without asking.
+            TRANSLATIONS="$(echo "${CONFLICTED}" | grep -E '(^|/)res/values[^/]*/[^/]+\.xml$' || true)"
+            if [ -n "${TRANSLATIONS}" ]; then
+              printf '%s\n' "${TRANSLATIONS}" > /tmp/auto-translations.txt
+              echo "${TRANSLATIONS}" | xargs -r git checkout --theirs --
+              echo "${TRANSLATIONS}" | xargs -r git add --
+            fi
+
+            # Anything left is a judgement call (moved files, refactors, fork-local
+            # features). Keep the fork's side so the branch still compiles, and let
+            # the pull request shout about it.
+            REMAINING="$(git diff --name-only --diff-filter=U)"
+
+            if [ -n "${REMAINING}" ]; then
+              printf '%s\n' "${REMAINING}" > /tmp/needs-review.txt
+              echo "${REMAINING}" | xargs -r git checkout --ours --
+              echo "${REMAINING}" | xargs -r git add --
+              echo "conflicts=$(echo "${REMAINING}" | grep -c .)" >> "$GITHUB_OUTPUT"
+            else
+              echo "conflicts=0" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+          git commit --no-verify -q -m "chore: sync ${UPSTREAM_REPO} ${UPSTREAM_REF} (${{ steps.fetch.outputs.sha }})"
+
+      - name: "Push sync branch"
+        if: steps.fetch.outputs.skip == 'false' && steps.exists.outputs.found == 'false'
+        run: git push --set-upstream origin "${{ steps.fetch.outputs.branch }}"
+
+      - name: "Build pull request body"
+        if: steps.fetch.outputs.skip == 'false' && steps.exists.outputs.found == 'false'
+        run: |
+          {
+            echo "Automated merge of \`${UPSTREAM_REPO}@${UPSTREAM_REF}\` (\`${{ steps.fetch.outputs.sha }}\`) into \`${BASE}\`."
+            echo
+            echo "**[${UPSTREAM_REPO}@${UPSTREAM_REF}](${GITHUB_SERVER_URL}/${UPSTREAM_REPO}/compare/${{ steps.fetch.outputs.sha }}...${UPSTREAM_REF})** is ${{ steps.fetch.outputs.behind }} commits ahead of \`origin/${BASE}\` at the time this branch was cut."
+            echo
+
+            if [ -s /tmp/needs-review.txt ]; then
+              echo "## ⚠️ Needs review"
+              echo
+              echo "These files had conflicts and were **resolved in favour of this fork** so the branch still builds. Upstream's changes to them were *not* applied — check each one, they may be renames or refactors that the fork's version has to be ported onto:"
+              echo
+              grep -v '^$' /tmp/needs-review.txt | sed 's/^/- `/; s/$/`/'
+              echo
+            fi
+
+            if [ -s /tmp/auto-translations.txt ]; then
+              echo "## Translations taken from upstream"
+              echo
+              echo "Conflict on the same keys; upstream's copy was kept:"
+              echo
+              grep -v '^$' /tmp/auto-translations.txt | sed 's/^/- `/; s/$/`/'
+              echo
+            fi
+
+            echo "## Upstream commits included"
+            echo
+            git log --reverse --format='- %s' "origin/${BASE}..upstream/${UPSTREAM_REF}"
+            echo
+            echo "## Not covered by automation"
+            echo
+            echo "This runs on a hosted runner, so nothing was installed or exercised on a device. Any behaviour change in authentication, location, attestation or billing still has to be smoke-tested by hand before this is merged."
+          } > /tmp/pr-body.md
+
+      - name: "Open pull request"
+        if: steps.fetch.outputs.skip == 'false' && steps.exists.outputs.found == 'false'
+        run: |
+          DRAFT=""
+          if [ "${{ steps.merge.outputs.conflicts }}" != "0" ]; then
+            DRAFT="--draft"
+            echo "Conflicts remain, opening a draft pull request." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          gh pr create \
+            --base "${BASE}" \
+            --head "${{ steps.fetch.outputs.branch }}" \
+            --title "chore: sync ${UPSTREAM_REPO} ${UPSTREAM_REF} (${{ steps.fetch.outputs.sha }})" \
+            --body-file /tmp/pr-body.md \
+            ${DRAFT}
